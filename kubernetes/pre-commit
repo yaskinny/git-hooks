@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+# pre checks
+dependsOn=( datree yq conftest kubeval )
+declare -a missingDeps
+
+for cmd in ${dependsOn[@]}; do
+  if ! which ${cmd} &>/dev/null ; then
+    missingDeps+=( ${cmd} )
+  fi
+done
+
+if (( ${#missingDeps[@]} != 0 )); then
+  for mc in ${missingDeps[@]}; do 
+    printf >&2 '%s\n' "${mc} is not installed or can not find it in ${PATH//:/ }"
+  done
+  exit 1
+fi
+
+set -euo pipefail
+
+tempFile=`mktemp`
+policyDir=`mktemp -d`
+
+# if You want to add conftest rules you can add after this deny rule
+cat > ${policyDir}/main.rego <<-THIS
+package main
+deny[msg] {
+    not input.metadata.namespace
+    msg := "no namespace specified for this manifest"
+}
+THIS
+
+_conftestCleanUp(){
+  set +eu
+  rm -rf ${policyDir}
+}
+
+_info(){
+  printf '%s\n' "[INFO] ${@}"
+}
+
+_warn(){
+  printf >&2 '%s\n' "[WARN] ${@}"
+}
+
+_err(){
+  printf >&2 '%s\n' "[ERROR] ${@}"
+  exit 1
+}
+
+trap "_conftestCleanUp" ERR EXIT SIGTERM SIGINT
+
+_datree(){
+  set +eu
+  hasKind=`yq eval .kind ${1}`
+  hasApiVersion=`yq eval .apiVersion ${1}`
+  if [[ "${hasKind}" = "null" || "${hasApiVersion}" = "null" ]] ; then 
+    _info "Skipping file ${1} - Seems not a K8s manifest, apiVersion: ${hasApiVersion}, kind: ${hasKind}"
+    return
+  fi
+  printf '%s\n' "============" "BEGIN ${1}" "============" >> ${tempFile}
+  _info "Checking file ${1}" | tee -a ${tempFile}
+  datree test "${1}" >> ${tempFile}
+  datreeRC=${?}
+  kubeval "${1}" >> ${tempFile}
+  kubevalRC=${?}
+  conftest test ${1} -p ${policyDir} >> ${tempFile}
+  conftestRC=${?}
+  if (( ${datreeRC} != 0 )) || (( ${kubevalRC} != 0 )) || (( ${conftestRC} != 0 )); then
+    failedOnes+=(${1})
+    printf '%s\n' "============" "FAILED ${1}" "============" >> ${tempFile}
+  fi
+  printf '%s\n' "============" "END ${1}" "============" >> ${tempFile}
+  set -eu
+}
+
+_checkFiles(){
+  while read -r line ; do 
+    _datree "${line}"
+  done < <(git diff --name-only --cached | grep -oP '.*\.ya?ml$')
+}
+
+declare -a failedOnes
+_main(){
+  _info "Results of checks are saving in file ${tempFile}"
+  _checkFiles
+  if grep -q FAILED ${tempFile}; then 
+    _err "Manifests didn't pass the checks, check results in ${tempFile}" "Failed Manifests:" ${failedOnes}
+    exit 1
+  fi
+  _info "All manifests passed checks."
+  _info "Removing temporary saved results in ${tempFile}"
+  rm -f ${tempFile}
+  exit 0
+}
+_main
